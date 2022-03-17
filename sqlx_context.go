@@ -161,8 +161,14 @@ func (db *DB) PreparexContext(ctx context.Context, query string) (*Stmt, error) 
 // QueryxContext queries the database and returns an *sqlx.Rows.
 // Any placeholder parameters are replaced with supplied args.
 func (db *DB) QueryxContext(ctx context.Context, query string, args ...interface{}) (*Rows, error) {
+	span, err := createSpan(ctx, db.tracer, db.opts, "queryx")
+	if err != nil {
+		return nil, err
+	}
+	defer span.End()
 	r, err := db.DB.QueryContext(ctx, query, args...)
 	if err != nil {
+		span.Error(time.Now(), err.Error())
 		return nil, err
 	}
 	return &Rows{Rows: r, unsafe: db.unsafe, Mapper: db.Mapper}, err
@@ -171,7 +177,16 @@ func (db *DB) QueryxContext(ctx context.Context, query string, args ...interface
 // QueryRowxContext queries the database and returns an *sqlx.Row.
 // Any placeholder parameters are replaced with supplied args.
 func (db *DB) QueryRowxContext(ctx context.Context, query string, args ...interface{}) *Row {
+	span, err := createSpan(ctx, db.tracer, db.opts, "queryx")
+	if err != nil {
+		return nil
+	}
+	defer span.End()
 	rows, err := db.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		span.Error(time.Now(), err.Error())
+	}
+
 	return &Row{rows: rows, err: err, unsafe: db.unsafe, Mapper: db.Mapper}
 }
 
