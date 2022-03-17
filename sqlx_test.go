@@ -15,6 +15,8 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"github.com/SkyAPM/go2sky"
+	"github.com/SkyAPM/go2sky/reporter"
 	"log"
 	"os"
 	"reflect"
@@ -23,9 +25,9 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/jmoiron/sqlx/reflectx"
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/mchobits/sqlx/reflectx"
 )
 
 /* compile time checks that Db, Tx, Stmt (qStmt) implement expected interfaces */
@@ -43,7 +45,11 @@ var pgdb *DB
 var mysqldb *DB
 var active = []*DB{}
 
+var tracer *go2sky.Tracer
+
 func init() {
+	re, _ := reporter.NewLogReporter()
+	tracer, _ = go2sky.NewTracer("sqlx-sky2go-tester", go2sky.WithReporter(re))
 	ConnectAll()
 }
 
@@ -63,7 +69,7 @@ func ConnectAll() {
 	}
 
 	if TestPostgres {
-		pgdb, err = Connect("postgres", pgdsn)
+		pgdb, err = Connect("postgres", pgdsn, tracer)
 		if err != nil {
 			fmt.Printf("Disabling PG tests:\n    %v\n", err)
 			TestPostgres = false
@@ -73,7 +79,7 @@ func ConnectAll() {
 	}
 
 	if TestMysql {
-		mysqldb, err = Connect("mysql", mydsn)
+		mysqldb, err = Connect("mysql", mydsn, tracer)
 		if err != nil {
 			fmt.Printf("Disabling MySQL tests:\n    %v", err)
 			TestMysql = false
@@ -83,7 +89,7 @@ func ConnectAll() {
 	}
 
 	if TestSqlite {
-		sldb, err = Connect("sqlite3", sqdsn)
+		sldb, err = Connect("sqlite3", sqdsn, tracer)
 		if err != nil {
 			fmt.Printf("Disabling SQLite:\n    %v", err)
 			TestSqlite = false
@@ -1217,7 +1223,7 @@ func TestUsage(t *testing.T) {
 
 		// create a copy and change the mapper, then verify the copy behaves
 		// differently from the original.
-		dbCopy := NewDb(db.DB, db.DriverName())
+		dbCopy := NewDb(db.DB, db.DriverName(), tracer)
 		dbCopy.MapperFunc(strings.ToUpper)
 		err = dbCopy.Get(&rsa, "SELECT * FROM capplace;")
 		if err != nil {
@@ -1307,7 +1313,7 @@ type Product struct {
 // tests that sqlx will not panic when the wrong driver is passed because
 // of an automatic nil dereference in sqlx.Open(), which was fixed.
 func TestDoNotPanicOnConnect(t *testing.T) {
-	db, err := Connect("bogus", "hehe")
+	db, err := Connect("bogus", "hehe", tracer)
 	if err == nil {
 		t.Errorf("Should return error when using bogus driverName")
 	}

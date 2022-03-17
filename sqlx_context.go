@@ -1,3 +1,4 @@
+//go:build go1.8
 // +build go1.8
 
 package sqlx
@@ -6,14 +7,16 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/SkyAPM/go2sky"
 	"io/ioutil"
 	"path/filepath"
 	"reflect"
+	"time"
 )
 
 // ConnectContext to a database and verify with a ping.
-func ConnectContext(ctx context.Context, driverName, dataSourceName string) (*DB, error) {
-	db, err := Open(driverName, dataSourceName)
+func ConnectContext(ctx context.Context, driverName, dataSourceName string, tracer *go2sky.Tracer, opts ...Option) (*DB, error) {
+	db, err := Open(driverName, dataSourceName, tracer, opts...)
 	if err != nil {
 		return db, err
 	}
@@ -201,8 +204,14 @@ func (db *DB) MustExecContext(ctx context.Context, query string, args ...interfa
 // transaction. Tx.Commit will return an error if the context provided to
 // BeginxContext is canceled.
 func (db *DB) BeginTxx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
+	span, err := createSpan(ctx, db.tracer, db.opts, "begin")
+	if err != nil {
+		return nil, err
+	}
+	defer span.End()
 	tx, err := db.DB.BeginTx(ctx, opts)
 	if err != nil {
+		span.Error(time.Now(), err.Error())
 		return nil, err
 	}
 	return &Tx{Tx: tx, driverName: db.driverName, unsafe: db.unsafe, Mapper: db.Mapper}, err
@@ -218,6 +227,42 @@ func (db *DB) Connx(ctx context.Context) (*Conn, error) {
 	return &Conn{Conn: conn, driverName: db.driverName, unsafe: db.unsafe, Mapper: db.Mapper}, nil
 }
 
+// PingContext support trace
+func (c *Conn) PingContext(ctx context.Context) error {
+	span, err := createSpan(ctx, c.db.tracer, c.db.opts, "ping")
+	if err != nil {
+		return err
+	}
+	defer span.End()
+	err = c.Conn.PingContext(ctx)
+	if err != nil {
+		span.Error(time.Now(), err.Error())
+	}
+	return err
+}
+
+// ExecContext support trace
+func (c *Conn) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	span, err := createSpan(ctx, c.db.tracer, c.db.opts, "execute")
+	if err != nil {
+		return nil, err
+	}
+	defer span.End()
+
+	if c.db.opts.reportQuery {
+		span.Tag(go2sky.TagDBStatement, query)
+	}
+	if c.db.opts.reportParam {
+		span.Tag(go2sky.TagDBSqlParameters, argsToString(args))
+	}
+
+	res, err := c.Conn.ExecContext(ctx, query, args...)
+	if err != nil {
+		span.Error(time.Now(), err.Error())
+	}
+	return res, err
+}
+
 // BeginTxx begins a transaction and returns an *sqlx.Tx instead of an
 // *sql.Tx.
 //
@@ -226,8 +271,15 @@ func (db *DB) Connx(ctx context.Context) (*Conn, error) {
 // transaction. Tx.Commit will return an error if the context provided to
 // BeginxContext is canceled.
 func (c *Conn) BeginTxx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
+	span, err := createSpan(ctx, c.db.tracer, c.db.opts, "begin")
+	if err != nil {
+		return nil, err
+	}
+	defer span.End()
+
 	tx, err := c.Conn.BeginTx(ctx, opts)
 	if err != nil {
+		span.Error(time.Now(), err.Error())
 		return nil, err
 	}
 	return &Tx{Tx: tx, driverName: c.driverName, unsafe: c.unsafe, Mapper: c.Mapper}, err
@@ -257,8 +309,22 @@ func (c *Conn) PreparexContext(ctx context.Context, query string) (*Stmt, error)
 // QueryxContext queries the database and returns an *sqlx.Rows.
 // Any placeholder parameters are replaced with supplied args.
 func (c *Conn) QueryxContext(ctx context.Context, query string, args ...interface{}) (*Rows, error) {
+	span, err := createSpan(ctx, c.db.tracer, c.db.opts, "query")
+	if err != nil {
+		return nil, err
+	}
+	defer span.End()
+
+	if c.db.opts.reportQuery {
+		span.Tag(go2sky.TagDBStatement, query)
+	}
+	if c.db.opts.reportParam {
+		span.Tag(go2sky.TagDBSqlParameters, argsToString(args))
+	}
+
 	r, err := c.Conn.QueryContext(ctx, query, args...)
 	if err != nil {
+		span.Error(time.Now(), err.Error())
 		return nil, err
 	}
 	return &Rows{Rows: r, unsafe: c.unsafe, Mapper: c.Mapper}, err
@@ -267,7 +333,23 @@ func (c *Conn) QueryxContext(ctx context.Context, query string, args ...interfac
 // QueryRowxContext queries the database and returns an *sqlx.Row.
 // Any placeholder parameters are replaced with supplied args.
 func (c *Conn) QueryRowxContext(ctx context.Context, query string, args ...interface{}) *Row {
+	span, err := createSpan(ctx, c.db.tracer, c.db.opts, "query")
+	if err != nil {
+		return nil
+	}
+	defer span.End()
+
+	if c.db.opts.reportQuery {
+		span.Tag(go2sky.TagDBStatement, query)
+	}
+	if c.db.opts.reportParam {
+		span.Tag(go2sky.TagDBSqlParameters, argsToString(args))
+	}
+
 	rows, err := c.Conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		span.Error(time.Now(), err.Error())
+	}
 	return &Row{rows: rows, err: err, unsafe: c.unsafe, Mapper: c.Mapper}
 }
 
@@ -325,8 +407,26 @@ func (tx *Tx) MustExecContext(ctx context.Context, query string, args ...interfa
 // QueryxContext within a transaction and context.
 // Any placeholder parameters are replaced with supplied args.
 func (tx *Tx) QueryxContext(ctx context.Context, query string, args ...interface{}) (*Rows, error) {
+	if id := go2sky.SpanID(ctx); id == go2sky.EmptySpanID {
+		// if ctx do not contain parent span, use transaction ctx instead
+		ctx = tx.ctx
+	}
+	span, err := createSpan(ctx, tx.db.tracer, tx.db.opts, "query")
+	if err != nil {
+		return nil, err
+	}
+	defer span.End()
+
+	if tx.db.opts.reportQuery {
+		span.Tag(go2sky.TagDBStatement, query)
+	}
+	if tx.db.opts.reportParam {
+		span.Tag(go2sky.TagDBSqlParameters, argsToString(args))
+	}
+
 	r, err := tx.Tx.QueryContext(ctx, query, args...)
 	if err != nil {
+		span.Error(time.Now(), err.Error())
 		return nil, err
 	}
 	return &Rows{Rows: r, unsafe: tx.unsafe, Mapper: tx.Mapper}, err
@@ -348,7 +448,27 @@ func (tx *Tx) GetContext(ctx context.Context, dest interface{}, query string, ar
 // QueryRowxContext within a transaction and context.
 // Any placeholder parameters are replaced with supplied args.
 func (tx *Tx) QueryRowxContext(ctx context.Context, query string, args ...interface{}) *Row {
+	if id := go2sky.SpanID(ctx); id == go2sky.EmptySpanID {
+		// if ctx do not contain parent span, use transaction ctx instead
+		ctx = tx.ctx
+	}
+	span, err := createSpan(ctx, tx.db.tracer, tx.db.opts, "query")
+	if err != nil {
+		return nil
+	}
+	defer span.End()
+
+	if tx.db.opts.reportQuery {
+		span.Tag(go2sky.TagDBStatement, query)
+	}
+	if tx.db.opts.reportParam {
+		span.Tag(go2sky.TagDBSqlParameters, argsToString(args))
+	}
+
 	rows, err := tx.Tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		span.Error(time.Now(), err.Error())
+	}
 	return &Row{rows: rows, err: err, unsafe: tx.unsafe, Mapper: tx.Mapper}
 }
 
@@ -356,6 +476,32 @@ func (tx *Tx) QueryRowxContext(ctx context.Context, query string, args ...interf
 // Any named placeholder parameters are replaced with fields from arg.
 func (tx *Tx) NamedExecContext(ctx context.Context, query string, arg interface{}) (sql.Result, error) {
 	return NamedExecContext(ctx, tx, query, arg)
+}
+
+// ExecContext support trace
+func (tx *Tx) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	if id := go2sky.SpanID(ctx); id == go2sky.EmptySpanID {
+		// if ctx do not contain parent span, use transaction ctx instead
+		ctx = tx.ctx
+	}
+	span, err := createSpan(ctx, tx.db.tracer, tx.db.opts, "execute")
+	if err != nil {
+		return nil, err
+	}
+	defer span.End()
+
+	if tx.db.opts.reportQuery {
+		span.Tag(go2sky.TagDBStatement, query)
+	}
+	if tx.db.opts.reportParam {
+		span.Tag(go2sky.TagDBSqlParameters, argsToString(args))
+	}
+
+	res, err := tx.Tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		span.Error(time.Now(), err.Error())
+	}
+	return res, err
 }
 
 // SelectContext using the prepared statement.
@@ -397,18 +543,50 @@ func (q *qStmt) QueryContext(ctx context.Context, query string, args ...interfac
 }
 
 func (q *qStmt) QueryxContext(ctx context.Context, query string, args ...interface{}) (*Rows, error) {
+	span, err := createSpan(ctx, q.db.tracer, q.db.opts, "query")
+	if err != nil {
+		return nil, err
+	}
+	defer span.End()
 	r, err := q.Stmt.QueryContext(ctx, args...)
 	if err != nil {
+		span.Error(time.Now(), err.Error())
 		return nil, err
 	}
 	return &Rows{Rows: r, unsafe: q.Stmt.unsafe, Mapper: q.Stmt.Mapper}, err
 }
 
 func (q *qStmt) QueryRowxContext(ctx context.Context, query string, args ...interface{}) *Row {
+	span, err := createSpan(ctx, q.db.tracer, q.db.opts, "query")
+	if err != nil {
+		return nil
+	}
+	defer span.End()
 	rows, err := q.Stmt.QueryContext(ctx, args...)
+	if err != nil {
+		span.Error(time.Now(), err.Error())
+	}
+
 	return &Row{rows: rows, err: err, unsafe: q.Stmt.unsafe, Mapper: q.Stmt.Mapper}
 }
 
 func (q *qStmt) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
-	return q.Stmt.ExecContext(ctx, args...)
+	span, err := createSpan(ctx, q.db.tracer, q.db.opts, "execute")
+	if err != nil {
+		return nil, err
+	}
+	defer span.End()
+
+	if q.db.opts.reportQuery {
+		span.Tag(go2sky.TagDBStatement, query)
+	}
+	if q.db.opts.reportParam {
+		span.Tag(go2sky.TagDBSqlParameters, argsToString(args))
+	}
+	result, err := q.Stmt.ExecContext(ctx, args...)
+	if err != nil {
+		span.Error(time.Now(), err.Error())
+	}
+
+	return result, err
 }

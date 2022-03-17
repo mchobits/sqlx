@@ -1,3 +1,4 @@
+//go:build go1.8
 // +build go1.8
 
 // The following environment variables, if set, will be used:
@@ -17,15 +18,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/SkyAPM/go2sky"
+	"github.com/SkyAPM/go2sky/reporter"
 	"log"
 	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/jmoiron/sqlx/reflectx"
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/mchobits/sqlx/reflectx"
 )
 
 func MultiExecContext(ctx context.Context, e ExecerContext, query string) {
@@ -1030,9 +1033,11 @@ func TestUsageContext(t *testing.T) {
 		}
 		db.MapperFunc(strings.ToLower)
 
+		re, err := reporter.NewLogReporter()
+		tracer, err := go2sky.NewTracer("sqlx-sky2go-tester", go2sky.WithReporter(re))
 		// create a copy and change the mapper, then verify the copy behaves
 		// differently from the original.
-		dbCopy := NewDb(db.DB, db.DriverName())
+		dbCopy := NewDb(db.DB, db.DriverName(), tracer)
 		dbCopy.MapperFunc(strings.ToUpper)
 		err = dbCopy.GetContext(ctx, &rsa, "SELECT * FROM capplace;")
 		if err != nil {
@@ -1118,7 +1123,10 @@ func TestUsageContext(t *testing.T) {
 // tests that sqlx will not panic when the wrong driver is passed because
 // of an automatic nil dereference in sqlx.Open(), which was fixed.
 func TestDoNotPanicOnConnectContext(t *testing.T) {
-	_, err := ConnectContext(context.Background(), "bogus", "hehe")
+	re, err := reporter.NewLogReporter()
+	tracer, err := go2sky.NewTracer("sqlx-sky2go-tester", go2sky.WithReporter(re))
+
+	_, err = ConnectContext(context.Background(), "bogus", "hehe", tracer)
 	if err == nil {
 		t.Errorf("Should return error when using bogus driverName")
 	}

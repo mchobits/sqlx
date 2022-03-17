@@ -1,6 +1,7 @@
 package sqlx
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
@@ -12,7 +13,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jmoiron/sqlx/reflectx"
+	"github.com/mchobits/sqlx/reflectx"
+
+	"github.com/SkyAPM/go2sky"
 )
 
 // Although the NameMapper is convenient, in practice it should not
@@ -244,11 +247,14 @@ type DB struct {
 	driverName string
 	unsafe     bool
 	Mapper     *reflectx.Mapper
+
+	tracer *go2sky.Tracer
+	opts   *options
 }
 
 // NewDb returns a new sqlx DB wrapper for a pre-existing *sql.DB.  The
 // driverName of the original database is required for named query support.
-func NewDb(db *sql.DB, driverName string) *DB {
+func NewDb(db *sql.DB, driverName string, tracer *go2sky.Tracer, opts ...Option) *DB {
 	return &DB{DB: db, driverName: driverName, Mapper: mapper()}
 }
 
@@ -258,17 +264,27 @@ func (db *DB) DriverName() string {
 }
 
 // Open is the same as sql.Open, but returns an *sqlx.DB instead.
-func Open(driverName, dataSourceName string) (*DB, error) {
+func Open(driverName, dataSourceName string, tracer *go2sky.Tracer, opts ...Option) (*DB, error) {
 	db, err := sql.Open(driverName, dataSourceName)
 	if err != nil {
 		return nil, err
 	}
-	return &DB{DB: db, driverName: driverName, Mapper: mapper()}, err
+	options := &options{
+		dbType:      IPV4,
+		componentID: componentIDUnknown,
+		reportQuery: false,
+		reportParam: false,
+	}
+	for _, o := range opts {
+		o(options)
+	}
+	return &DB{DB: db, driverName: driverName, Mapper: mapper(), tracer: tracer,
+		opts: options}, err
 }
 
 // MustOpen is the same as sql.Open, but returns an *sqlx.DB instead and panics on error.
-func MustOpen(driverName, dataSourceName string) *DB {
-	db, err := Open(driverName, dataSourceName)
+func MustOpen(driverName, dataSourceName string, tracer *go2sky.Tracer, opts ...Option) *DB {
+	db, err := Open(driverName, dataSourceName, tracer, opts...)
 	if err != nil {
 		panic(err)
 	}
@@ -382,6 +398,8 @@ type Conn struct {
 	driverName string
 	unsafe     bool
 	Mapper     *reflectx.Mapper
+
+	db *DB
 }
 
 // Tx is an sqlx wrapper around sql.Tx with extra functionality
@@ -390,6 +408,9 @@ type Tx struct {
 	driverName string
 	unsafe     bool
 	Mapper     *reflectx.Mapper
+
+	db  *DB
+	ctx context.Context
 }
 
 // DriverName returns the driverName used by the DB which began this transaction.
@@ -502,6 +523,8 @@ type Stmt struct {
 	*sql.Stmt
 	unsafe bool
 	Mapper *reflectx.Mapper
+
+	db *DB
 }
 
 // Unsafe returns a version of Stmt which will silently succeed to scan when
@@ -634,8 +657,8 @@ func (r *Rows) StructScan(dest interface{}) error {
 }
 
 // Connect to a database and verify with a ping.
-func Connect(driverName, dataSourceName string) (*DB, error) {
-	db, err := Open(driverName, dataSourceName)
+func Connect(driverName, dataSourceName string, tracer *go2sky.Tracer, opts ...Option) (*DB, error) {
+	db, err := Open(driverName, dataSourceName, tracer, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -648,8 +671,8 @@ func Connect(driverName, dataSourceName string) (*DB, error) {
 }
 
 // MustConnect connects to a database and panics on error.
-func MustConnect(driverName, dataSourceName string) *DB {
-	db, err := Connect(driverName, dataSourceName)
+func MustConnect(driverName, dataSourceName string, tracer *go2sky.Tracer, opts ...Option) *DB {
+	db, err := Connect(driverName, dataSourceName, tracer, opts...)
 	if err != nil {
 		panic(err)
 	}
